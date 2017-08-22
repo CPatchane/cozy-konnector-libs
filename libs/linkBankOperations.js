@@ -25,12 +25,9 @@ const fetchNeighboringOperations = (bill, options) => {
 }
 
 const findMatchingOperation = (bill, operations, options) => {
-  let operationToLink = null
-  let candidateOperationsForLink = []
-  let minAmountDelta = Infinity
   let amount = Math.abs(bill.amount)
 
-  // By default, an bill is an expense. If it is not, it should be
+  // By default, a bill is an expense. If it is not, it should be
   // declared as a refund: isRefund=true.
   if (bill.isRefund === true) amount *= -1
 
@@ -49,41 +46,108 @@ const findMatchingOperation = (bill, operations, options) => {
     for (let identifier of options.identifiers) {
       const hasIdentifier =
         operation.label.toLowerCase().indexOf(identifier) >= 0
-      const similarAmount =
-        amountDelta <= options.amountDelta && amountDelta <= minAmountDelta
+      const similarAmount = amountDelta <= options.amountDelta
       if (hasIdentifier && similarAmount) {
-        operationToLink = operation
-        minAmountDelta = amountDelta
-        return operationToLink
+        return operation
       }
     }
   }
   return null
 }
 
-const addBillToOperation = function(bill, matchingOperation) {
-  log('debug', matchingOperation, 'There is an operation to link')
+const reimbursedTypes = ['health_costs']
 
-  if (matchingOperation.bills && matchingOperation.bills.indexOf(bill._id) > -1) {
+const equalDates = function (d1, d2) {
+  return d1 && d2 && d1.year == d2.year && d1.month == d2.month && d1.date == d2.date
+}
+
+const findReimbursedOperation = (bill, operations, options) => {
+  let originalAmount = Math.abs(bill.originalAmount)
+
+  const canBeReimbursed = reimbursedTypes.indexOf(bill.type) > -1
+  if (!canBeReimbursed) {
+    return null
+  }
+
+  // By default, an bill is an expense. If it is not, it should be
+  // declared as a refund: isRefund=true.
+  if (bill.isRefund === true) originalAmount *= -1
+
+  for (let operation of operations) {
+    let opAmount = operation.amount
+    // By default, an bill is an expense. If it is not, it should be
+    // declared as a refund: isRefund=true.
+    if (bill.isRefund === true) opAmount *= -1
+
+    const amountExpensedInferiorToReimbursement = bill.amount < opAmount
+    const sameAmount = originalAmount == operation.amount
+    const sameDate = equalDates(bill.originalDate, operation.date)
+    if (sameAmount && sameDate && amountExpensedInferiorToReimbursement) {
+      return operation
+    }
+  }
+  return null
+}
+
+const addBillToOperation = function(bill, operation) {
+  if (operation.bills && operation.bills.indexOf(bill._id) > -1) {
     return Promise.resolve()
   }
 
-  const billIds = matchingOperation.billIds || []
+  const billIds = operation.billIds || []
   billIds.push(`io.cozy.bills:${bill._id}`)
 
-  return cozyClient.data.updateAttributes(DOCTYPE, matchingOperation._id, {
+  return cozyClient.data.updateAttributes(DOCTYPE, operation._id, {
     bills: billIds
   })
 }
 
+const addReimbursementToOperation = function (bill, operation, matchingOperation) {
+  if (operation.reimbursements && operation.reimbursements.indexOf(bill._id) > -1) {
+    return Promise.resolve()
+  }
+
+  const reimbursements = operation.reimbursements || []
+  reimbursements.push({
+    billId: `io.cozy.bills:${bill._id}`,
+    amount: bill.amount,
+    operationId: matchingOperation && matchingOperation._id
+  })
+
+  return cozyClient.data.updateAttributes(DOCTYPE, operation._id, {
+    reimbursements: reimbursements
+  })
+}
+
+const linkMatchingOperation = function (bill, operations, options) {
+  const matchingOp = findMatchingOperation(bill, operations, options)
+  if (matchingOp){
+    if (!matchingOp) { return }
+    return addBillToOperation(bill, matchingOp)
+  }
+}
+
+const linkReimbursedOperation = function (bill, operations, options, matchingOp) {
+  const reimbursedOp = findReimbursedOperation(bill, operations, options)
+  if (!reimbursedOp) { return }
+  return addReimbursementToOperation(bill, reimbursedOp, matchingOp)
+}
+
+/**
+ * Link bills to
+ *   - their matching banking operation (debit)
+ *   - to their reimbursement (credit)
+ */
 const linkBillsToOperations = function(bills, options) {
   return bluebird.each(bills, bill => {
+    // Get all operations whose date is close to out bill
+    let operations
     return fetchNeighboringOperations(bill, options)
-      .then(operations => findMatchingOperation(bill, operations, options))
-      .then(matchingOperation => {
-        if (matchingOperation) {
-          return addBillToOperation(bill, matchingOperation)
-        }
+      .then(ops => {
+        operations = ops
+        return linkMatchingOperation(bill, operations, options)
+      }).then(matchingOperation => {
+        return linkReimbursedOperation(bill, operations, options, matchingOperation)
       })
   })
 }
@@ -113,7 +177,10 @@ module.exports = (bills, doctype, fields, options = {}) => {
   return linkBillsToOperations(bills, options)
 }
 
-module.exports.fetchNeighboringOperations = fetchNeighboringOperations
-module.exports.findMatchingOperation = findMatchingOperation
-module.exports.addBillToOperation = addBillToOperation
-module.exports.linkBillsToOperations = linkBillsToOperations
+Object.assign(module.exports, {
+  fetchNeighboringOperations,
+  findMatchingOperation,
+  addBillToOperation,
+  linkBillsToOperations,
+  findReimbursedOperation
+})
